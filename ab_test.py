@@ -302,9 +302,10 @@ class Player:
         self.paused = False
         self.range_start = 0
         self.range_end = 0
+        self.volume = 1.0
         self.lock = threading.Lock()
 
-    def play(self, data, sr, loop=False):
+    def play(self, data, sr, loop=False, start_frame=0):
         data = np.ascontiguousarray(data, dtype=np.float32)
         if data.ndim == 1:
             data = data[:, None]
@@ -312,10 +313,14 @@ class Player:
             return
         with self.lock:
             self.cur = data
-            self.pos = 0
+            self.pos = max(0, min(start_frame, len(data) - 1))
             self.loop = loop
             self.paused = False
         self._ensure_stream(sr, data.shape[1])
+
+    def set_volume(self, value):
+        with self.lock:
+            self.volume = max(0.0, min(1.0, value))
 
     def set_loop(self, loop):
         with self.lock:
@@ -387,30 +392,21 @@ class Player:
                 outdata[:] = 0
                 return
             length = len(current)
-            if self.loop and self.range_end > self.range_start:
+            vol = self.volume
+            if self.range_end > self.range_start:
                 range_len = self.range_end - self.range_start
                 offset = self.pos - self.range_start
                 idx = (np.arange(frames) + offset) % range_len + self.range_start
-                outdata[:] = current[idx]
+                outdata[:] = current[idx] * vol
                 self.pos = int((offset + frames) % range_len + self.range_start)
-            elif self.range_end > self.range_start:
-                available = self.range_end - self.pos
-                take = min(frames, max(available, 0))
-                if take > 0:
-                    outdata[:take] = current[self.pos:self.pos + take]
-                if take < frames:
-                    outdata[take:] = 0
-                    self.cur = None
-                else:
-                    self.pos += take
             elif self.loop:
                 idx = (np.arange(frames) + self.pos) % length
-                outdata[:] = current[idx]
+                outdata[:] = current[idx] * vol
                 self.pos = int((self.pos + frames) % length)
             else:
                 take = min(frames, length - self.pos)
                 if take > 0:
-                    outdata[:take] = current[self.pos:self.pos + take]
+                    outdata[:take] = current[self.pos:self.pos + take] * vol
                 if take < frames:
                     outdata[take:] = 0
                     self.cur = None
@@ -717,7 +713,7 @@ class TestPage(Page):
     def _build(self):
         root = QVBoxLayout(self)
         root.setContentsMargins(32, 30, 32, 32)
-        root.setSpacing(16)
+        root.setSpacing(12)
 
         progress_card = Card(self, margins=(24, 18, 24, 18), spacing=10)
         self.progress_label = QLabel('')
@@ -728,7 +724,7 @@ class TestPage(Page):
         progress_card.layout.addWidget(self.progress)
         root.addWidget(progress_card)
 
-        play_card = Card(self, margins=(24, 24, 24, 24))
+        play_card = Card(self, margins=(24, 20, 24, 20), spacing=10)
         play_row = QHBoxLayout()
         play_row.setSpacing(14)
         self.btn_a = QPushButton('▶ 播放 A')
@@ -772,26 +768,38 @@ class TestPage(Page):
         stop_btn.clicked.connect(self.stop)
         self.loop_box = QCheckBox('循环播放 (L)')
         self.loop_box.toggled.connect(self.player.set_loop)
+        volume_label = QLabel('音量')
+        volume_label.setObjectName('hint')
+        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(100)
+        self.volume_slider.setFixedWidth(120)
+        self.volume_slider.setFocusPolicy(Qt.NoFocus)
+        self.volume_slider.valueChanged.connect(
+            lambda v: self.player.set_volume(v / 100.0))
         clear_btn = QPushButton('清除选区')
         clear_btn.setObjectName('secondary')
         clear_btn.setFocusPolicy(Qt.NoFocus)
         clear_btn.clicked.connect(self._clear_range)
-        shortcut_hint = QLabel('快捷键：A / B 播放 · 空格 停止 · L 循环 · 回车 下一项')
-        shortcut_hint.setObjectName('hint')
         controls.addWidget(self.btn_pause)
         controls.addWidget(stop_btn)
         controls.addWidget(self.loop_box)
+        controls.addWidget(volume_label)
+        controls.addWidget(self.volume_slider)
         controls.addWidget(clear_btn)
         controls.addStretch(1)
-        controls.addWidget(shortcut_hint)
+        shortcut_hint = QLabel('快捷键：A / B 播放 · 空格 停止 · L 循环 · 回车 下一项 · 时间轴拖拽选区循环')
+        shortcut_hint.setObjectName('hint')
+        shortcut_hint.setAlignment(Qt.AlignCenter)
         play_card.layout.addLayout(play_row)
         play_card.layout.addWidget(self.play_label)
         play_card.layout.addWidget(self.timeline)
         play_card.layout.addLayout(time_row)
         play_card.layout.addLayout(controls)
+        play_card.layout.addWidget(shortcut_hint)
         root.addWidget(play_card)
 
-        rating_card = Card(self, margins=(24, 24, 24, 24), spacing=16)
+        rating_card = Card(self, margins=(24, 20, 24, 20), spacing=14)
         rating_grid = QGridLayout()
         rating_grid.setHorizontalSpacing(16)
         self.rated_a = False
@@ -802,7 +810,7 @@ class TestPage(Page):
         rating_card.layout.addLayout(rating_grid)
         root.addWidget(rating_card, 1)
 
-        bottom_card = Card(self, margins=(24, 20, 24, 20), spacing=10)
+        bottom_card = Card(self, margins=(24, 18, 24, 18), spacing=8)
         comment_label = QLabel('备注（可选）')
         comment_label.setObjectName('field')
         self.comment_edit = QLineEdit()
@@ -979,12 +987,22 @@ class TestPage(Page):
         if not buffer:
             return
         data, sr = buffer
+        pos_sec = 0.0
+        if self.playing and self.playing in self.buf and self.playing != which:
+            old_data, old_sr = self.buf[self.playing]
+            old_pos = self.player.get_position()
+            pos_sec = old_pos / old_sr if old_sr else 0.0
+        elif self.playing == which and self.player.get_position() > 0:
+            pos_sec = self.player.get_position() / sr
+        start_frame = int(pos_sec * sr) if pos_sec > 0 else 0
+        start_frame = max(0, min(start_frame, len(data) - 1))
         try:
-            self.player.play(data, sr, self.loop_box.isChecked())
+            self.player.play(data, sr, self.loop_box.isChecked(), start_frame)
         except Exception as exc:
             QMessageBox.critical(self, '播放失败', str(exc))
             return
         self.playing = which
+        self._apply_range_to_player()
         self._update_play_state()
         self.poll_timer.start()
         self.btn_pause.setText('⏸ 暂停')
